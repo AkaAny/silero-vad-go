@@ -1,0 +1,4 @@
+.idea
+/onnxruntime-osx-arm64-1.18.1
+onnxruntime.tgz
+native/build

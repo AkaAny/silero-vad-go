@@ -1,14 +1,8 @@
 package speech
 
-// #cgo CFLAGS: -Wall -Werror -std=c99
-// #cgo LDFLAGS: -lonnxruntime
-// #include "ort_bridge.h"
-import "C"
-
 import (
 	"fmt"
 	"log/slog"
-	"unsafe"
 )
 
 const (
@@ -18,20 +12,20 @@ const (
 
 type LogLevel int
 
-func (l LogLevel) OrtLoggingLevel() C.OrtLoggingLevel {
+func (l LogLevel) bridgeLogLevel() int32 {
 	switch l {
 	case LevelVerbose:
-		return C.ORT_LOGGING_LEVEL_VERBOSE
+		return 0
 	case LogLevelInfo:
-		return C.ORT_LOGGING_LEVEL_INFO
+		return 1
 	case LogLevelWarn:
-		return C.ORT_LOGGING_LEVEL_WARNING
+		return 2
 	case LogLevelError:
-		return C.ORT_LOGGING_LEVEL_ERROR
+		return 3
 	case LogLevelFatal:
-		return C.ORT_LOGGING_LEVEL_FATAL
+		return 4
 	default:
-		return C.ORT_LOGGING_LEVEL_WARNING
+		return 2
 	}
 }
 
@@ -83,12 +77,7 @@ func (c DetectorConfig) IsValid() error {
 }
 
 type Detector struct {
-	api         *C.OrtApi
-	env         *C.OrtEnv
-	sessionOpts *C.OrtSessionOptions
-	session     *C.OrtSession
-	memoryInfo  *C.OrtMemoryInfo
-	cStrings    map[string]*C.char
+	bridge *ortBridge
 
 	cfg DetectorConfig
 
@@ -106,64 +95,14 @@ func NewDetector(cfg DetectorConfig) (*Detector, error) {
 	}
 
 	sd := Detector{
-		cfg:      cfg,
-		cStrings: map[string]*C.char{},
+		cfg: cfg,
 	}
 
-	sd.api = C.OrtGetApi()
-	if sd.api == nil {
-		return nil, fmt.Errorf("failed to get API")
+	var err error
+	sd.bridge, err = newOrtBridge(cfg.ModelPath, cfg.SampleRate, cfg.LogLevel.bridgeLogLevel())
+	if err != nil {
+		return nil, fmt.Errorf("failed to create native detector: %w", err)
 	}
-
-	sd.cStrings["loggerName"] = C.CString("vad")
-	status := C.OrtApiCreateEnv(sd.api, cfg.LogLevel.OrtLoggingLevel(), sd.cStrings["loggerName"], &sd.env)
-	defer C.OrtApiReleaseStatus(sd.api, status)
-	if status != nil {
-		return nil, fmt.Errorf("failed to create env: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
-	}
-
-	status = C.OrtApiCreateSessionOptions(sd.api, &sd.sessionOpts)
-	defer C.OrtApiReleaseStatus(sd.api, status)
-	if status != nil {
-		return nil, fmt.Errorf("failed to create session options: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
-	}
-
-	status = C.OrtApiSetIntraOpNumThreads(sd.api, sd.sessionOpts, 1)
-	defer C.OrtApiReleaseStatus(sd.api, status)
-	if status != nil {
-		return nil, fmt.Errorf("failed to set intra threads: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
-	}
-
-	status = C.OrtApiSetInterOpNumThreads(sd.api, sd.sessionOpts, 1)
-	defer C.OrtApiReleaseStatus(sd.api, status)
-	if status != nil {
-		return nil, fmt.Errorf("failed to set inter threads: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
-	}
-
-	status = C.OrtApiSetSessionGraphOptimizationLevel(sd.api, sd.sessionOpts, C.ORT_ENABLE_ALL)
-	defer C.OrtApiReleaseStatus(sd.api, status)
-	if status != nil {
-		return nil, fmt.Errorf("failed to set session graph optimization level: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
-	}
-
-	sd.cStrings["modelPath"] = C.CString(sd.cfg.ModelPath)
-	status = C.OrtApiCreateSession(sd.api, sd.env, sd.cStrings["modelPath"], sd.sessionOpts, &sd.session)
-	defer C.OrtApiReleaseStatus(sd.api, status)
-	if status != nil {
-		return nil, fmt.Errorf("failed to create session: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
-	}
-
-	status = C.OrtApiCreateCpuMemoryInfo(sd.api, C.OrtArenaAllocator, C.OrtMemTypeDefault, &sd.memoryInfo)
-	defer C.OrtApiReleaseStatus(sd.api, status)
-	if status != nil {
-		return nil, fmt.Errorf("failed to create memory info: %s", C.GoString(C.OrtApiGetErrorMessage(sd.api, status)))
-	}
-
-	sd.cStrings["input"] = C.CString("input")
-	sd.cStrings["sr"] = C.CString("sr")
-	sd.cStrings["state"] = C.CString("state")
-	sd.cStrings["stateN"] = C.CString("stateN")
-	sd.cStrings["output"] = C.CString("output")
 
 	return &sd, nil
 }
@@ -278,12 +217,9 @@ func (sd *Detector) Destroy() error {
 		return fmt.Errorf("invalid nil detector")
 	}
 
-	C.OrtApiReleaseMemoryInfo(sd.api, sd.memoryInfo)
-	C.OrtApiReleaseSession(sd.api, sd.session)
-	C.OrtApiReleaseSessionOptions(sd.api, sd.sessionOpts)
-	C.OrtApiReleaseEnv(sd.api, sd.env)
-	for _, ptr := range sd.cStrings {
-		C.free(unsafe.Pointer(ptr))
+	if sd.bridge != nil {
+		sd.bridge.Destroy()
+		sd.bridge = nil
 	}
 
 	return nil
